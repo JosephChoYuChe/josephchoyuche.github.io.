@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>多筆倒數計時（4碼編號＋HHMM｜顯示 079-1｜無鈴聲｜自動開始）</title>
+  <style>
+    :root { --bg:#0f172a; --card:#0b1220; --muted:#94a3b8; --text:#e5e7eb; --accent:#60a5fa; --danger:#f87171; --ok:#34d399; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Arial; background:#0f172a; color:var(--text); }
+    .container { max-width:1100px; margin:24px auto; padding:0 16px 48px; }
+    h1 { margin:0 0 12px; font-size:26px; letter-spacing:.4px; }
+    .card { background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:16px; box-shadow: 0 10px 30px rgba(0,0,0,.25); backdrop-filter: blur(6px); }
+    .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    input[type="text"] { padding:10px; font-size:16px; border-radius:10px; border:1px solid rgba(255,255,255,.12); background:#0b1220; color:var(--text); outline:none; width:360px; }
+    button { padding:10px 14px; font-size:14px; border:1px solid rgba(255,255,255,.12); border-radius:10px; background:#2563eb; color:#fff; cursor:pointer; }
+    button.ghost { background:transparent; }
+    button.danger { background:linear-gradient(135deg,#ef4444,#f59e0b); }
+    button.ok { background:linear-gradient(135deg,#10b981,#22d3ee); }
+    button:disabled { background:#475569; cursor:not-allowed; }
+    .muted { color:var(--muted); }
+
+    table { width:100%; border-collapse: collapse; margin-top:12px; }
+    thead th { position:sticky; top:0; background:#111827; color:#cbd5e1; font-weight:600; text-align:left; padding:10px; border-bottom:1px solid rgba(255,255,255,.12); }
+    tbody td { padding:10px; border-bottom:1px dashed rgba(255,255,255,.08); vertical-align:middle; }
+    tbody tr.running { background:rgba(96,165,250,.06); }
+    tbody tr.paused { background:rgba(148,163,184,.06); }
+    tbody tr.done { background:rgba(52,211,153,.08); }
+    .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid rgba(255,255,255,.1); color:#cbd5e1; }
+    .actions button { padding:6px 10px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="card">
+      <h1>多筆倒數計時（4碼編號 + HHMM）</h1>
+      <div class="row">
+        <input id="codeInput" type="text" placeholder="輸入：4碼編號＋HHMM，例 07910810 ⇒ 編號 079-1、倒數 08:10" />
+        <button id="addBtn" class="ok">加入倒數</button>
+        <span class="muted">規則：前 4 碼是編號（顯示為 079-1），後 4 碼是倒數 <strong>HHMM</strong>；分鐘 00–59，小時 00–99。</span>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th style="width:140px">編號</th>
+            <th style="width:120px">設定時長</th>
+            <th style="width:140px">剩餘</th>
+            <th style="width:120px">狀態</th>
+            <th style="width:260px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+
+      <div class="row" style="margin-top:8px">
+        <button id="startAll" class="ok">全部開始</button>
+        <button id="pauseAll" class="ghost">全部暫停</button>
+        <button id="resetAll" class="ghost">全部重置</button>
+        <button id="clearDone" class="ghost">清除已完成</button>
+        <span class="muted">可同時執行 ≧ 20 筆，離線可用，資料將儲存於瀏覽器。</span>
+      </div>
+    </section>
+  </div>
+
+<script>
+// ===== 小工具 =====
+function pad2(n){ return String(n).padStart(2,'0'); }
+function fmtHMS(sec){ const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=sec%60; return pad2(h)+":"+pad2(m)+":"+pad2(s); }
+function formatCode4(raw4){ return raw4.slice(0,3) + '-' + raw4.slice(3); }
+function isEightDigits(s){ if(!s || s.length!==8) return false; for(let i=0;i<8;i++){ const c=s.charCodeAt(i); if(c<48||c>57) return false; } return true; }
+
+// ===== DOM =====
+const codeInput = document.getElementById('codeInput');
+const addBtn = document.getElementById('addBtn');
+const tbody = document.getElementById('tbody');
+const startAllBtn = document.getElementById('startAll');
+const pauseAllBtn = document.getElementById('pauseAll');
+const resetAllBtn = document.getElementById('resetAll');
+const clearDoneBtn = document.getElementById('clearDone');
+
+// ===== 狀態 =====
+const KEY = 'multi_countdowns_v1';
+const timers = new Map(); // id -> {codeRaw, code, total, left, endAt, running, el}
+let ticker = null;
+
+function save(){
+  const arr = Array.from(timers.values()).map(function(t){
+    return { id:t.id, code:t.code, codeRaw:t.codeRaw, total:t.total, left:t.left, endAt:t.endAt, running:t.running };
+  });
+  localStorage.setItem(KEY, JSON.stringify(arr));
+}
+function load(){
+  try{
+    const raw = localStorage.getItem(KEY); if(!raw) return;
+    const arr = JSON.parse(raw);
+    for(const t of arr){
+      const codeRaw = t.codeRaw ? String(t.codeRaw).padStart(4,'0') : String((t.code||'').replace('-', '')).padStart(4,'0');
+      const code = formatCode4(codeRaw);
+      addRow({codeRaw:codeRaw, code:code, total:t.total}, t.id, t.left, t.endAt, t.running);
+    }
+  }catch(e){}
+}
+function ensureTicker(){ if(ticker) return; ticker = setInterval(tickAll, 250); }
+function stopTicker(){ if(!ticker) return; clearInterval(ticker); ticker=null; }
+
+// ===== 解析與新增 =====
+function parseCode(str){
+  const raw = (str||'').trim();
+  if(!isEightDigits(raw)) return null; // 僅允許 8 碼：前4碼編號、後4碼HHMM
+  const codeRaw = raw.slice(0,4); // 4 碼
+  const HH = Number(raw.slice(4,6));
+  const MM = Number(raw.slice(6,8));
+  if(!Number.isInteger(HH) || !Number.isInteger(MM) || MM>59 || HH<0) return null;
+  const code = formatCode4(codeRaw);
+  const total = Math.max(0, Math.min(99, HH))*3600 + Math.max(0, Math.min(59, MM))*60;
+  return { codeRaw:codeRaw, code:code, HH:HH, MM:MM, total:total };
+}
+
+function makeCell(tag){ const el=document.createElement(tag||'td'); return el; }
+
+function addRow(parsedOrObj, presetId, presetLeft, presetEndAt, presetRunning){
+  const codeRaw = parsedOrObj.codeRaw; // 4 碼（不含 - ）
+  const code = parsedOrObj.code;       // 顯示格式 079-1
+  const total = parsedOrObj.total;
+  const id = presetId || codeRaw + '_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+
+  const tr = document.createElement('tr'); tr.dataset.id=id; tr.classList.add('paused');
+  const tdCode = makeCell('td'); tdCode.textContent = code; tdCode.classList.add('mono');
+  const tdSet = makeCell('td'); tdSet.textContent = fmtHMS(total).slice(0,5); tdSet.classList.add('mono');
+  const tdLeft = makeCell('td'); tdLeft.textContent = fmtHMS(total); tdLeft.classList.add('mono');
+  const tdStatus = makeCell('td'); tdStatus.innerHTML = '<span class="pill">待命</span>';
+  const tdAct = makeCell('td'); tdAct.classList.add('actions');
+
+  const btnStart = document.createElement('button'); btnStart.textContent='開始';
+  const btnPause = document.createElement('button'); btnPause.textContent='暫停'; btnPause.disabled=true;
+  const btnReset = document.createElement('button'); btnReset.textContent='重置'; btnReset.disabled=true;
+  const btnDel = document.createElement('button'); btnDel.textContent='刪除'; btnDel.classList.add('ghost');
+  tdAct.append(btnStart, btnPause, btnReset, btnDel);
+
+  tr.append(tdCode, tdSet, tdLeft, tdStatus, tdAct);
+  tbody.prepend(tr);
+
+  const t = { id:id, codeRaw:codeRaw, code:code, total:total, left: total, endAt: 0, running: false, el:{tr:tr, tdLeft:tdLeft, tdStatus:tdStatus, btnStart:btnStart, btnPause:btnPause, btnReset:btnReset} };
+  if(presetLeft!==undefined && presetLeft!==null) t.left = presetLeft;
+  if(presetEndAt) t.endAt = presetEndAt;
+  if(presetRunning){ if(t.endAt && t.endAt>Date.now()){ t.running=true; setRowState(t,'running','倒數中'); ensureTicker(); } else { t.running=false; t.left=0; setRowState(t,'done','完成'); } }
+  timers.set(id, t);
+
+  btnStart.addEventListener('click', function(){ startRow(id); });
+  btnPause.addEventListener('click', function(){ pauseRow(id); });
+  btnReset.addEventListener('click', function(){ resetRow(id); });
+  btnDel.addEventListener('click', function(){ deleteRow(id); });
+
+  save();
+  return id;
+}
+
+// ===== 控制單列 =====
+function setRowState(t, klass, label){
+  t.el.tr.classList.remove('running','paused','done');
+  t.el.tr.classList.add(klass);
+  t.el.tdStatus.innerHTML = '<span class="pill">' + label + '</span>';
+  t.el.btnStart.textContent = t.running ? '暫停' : '開始';
+  t.el.btnPause.disabled = !t.running;
+  t.el.btnReset.disabled = false;
+}
+
+function startRow(id){
+  const t = timers.get(id); if(!t) return;
+  if(t.running){ pauseRow(id); return; }
+  if(t.left<=0){ t.left = t.total; }
+  t.endAt = Date.now() + t.left*1000;
+  t.running = true;
+  setRowState(t,'running','倒數中');
+  ensureTicker();
+  save();
+}
+function pauseRow(id){ const t = timers.get(id); if(!t||!t.running) return; t.left = Math.max(0, Math.round((t.endAt - Date.now())/1000)); t.running=false; setRowState(t,'paused','暫停'); save(); }
+function resetRow(id){ const t = timers.get(id); if(!t) return; t.left=t.total; t.running=false; t.endAt=0; t.el.tdLeft.textContent=fmtHMS(t.left); setRowState(t,'paused','待命'); save(); }
+function deleteRow(id){ const t = timers.get(id); if(!t) return; t.el.tr.remove(); timers.delete(id); if(timers.size===0) stopTicker(); save(); }
+
+// ===== 全域 Ticker =====
+function tickAll(){
+  const now = Date.now(); let anyRunning=false;
+  timers.forEach(function(t){
+    if(t.running){ anyRunning=true; t.left = Math.max(0, Math.round((t.endAt - now)/1000)); t.el.tdLeft.textContent = fmtHMS(t.left); if(t.left<=0){ t.running=false; t.el.tdLeft.textContent='00:00:00'; setRowState(t,'done','完成'); save(); } }
+  });
+  if(!anyRunning && timers.size===0) stopTicker();
+}
+
+// ===== 事件綁定（自動加入＋自動開始＋清空輸入） =====
+addBtn.addEventListener('click', function(){
+  const p = parseCode(codeInput.value);
+  if(!p){ alert('請輸入 8 位數：前 4 碼為編號，後 4 碼為 HHMM，例如 07910810（顯示編號 079-1，倒數 08:10）'); return; }
+  const newId = addRow({codeRaw:p.codeRaw, code:p.code, total:p.total}); startRow(newId); codeInput.value='';
+});
+codeInput.addEventListener('keydown', function(e){ if(e.key==='Enter'){ const p=parseCode(codeInput.value); if(p){ const id=addRow({codeRaw:p.codeRaw, code:p.code, total:p.total}); startRow(id); codeInput.value=''; } } });
+codeInput.addEventListener('input', function(){ const p=parseCode(codeInput.value); if(p){ const id=addRow({codeRaw:p.codeRaw, code:p.code, total:p.total}); startRow(id); codeInput.value=''; } });
+
+// 初始化
+load(); ensureTicker();
+</script>
+</body>
+</html>
